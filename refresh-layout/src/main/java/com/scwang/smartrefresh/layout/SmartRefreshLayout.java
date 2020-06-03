@@ -393,14 +393,22 @@ public class SmartRefreshLayout extends ViewGroup implements RefreshLayout, Nest
 
             if (mRefreshHeader == null) {
                 if (sHeaderCreator != null) {
-                    setRefreshHeader(sHeaderCreator.createRefreshHeader(thisView.getContext(), this));
+                    RefreshHeader header = sHeaderCreator.createRefreshHeader(thisView.getContext(), this);
+                    if (header == null) {
+                        throw new RuntimeException("DefaultRefreshHeaderCreator can not return null");
+                    }
+                    setRefreshHeader(header);
                 } else {
                     setRefreshHeader(new BezierRadarHeader(thisView.getContext()));
                 }
             }
             if (mRefreshFooter == null) {
                 if (sFooterCreator != null) {
-                    setRefreshFooter(sFooterCreator.createRefreshFooter(thisView.getContext(), this));
+                    RefreshFooter footer = sFooterCreator.createRefreshFooter(thisView.getContext(), this);
+                    if (footer == null) {
+                        throw new RuntimeException("DefaultRefreshFooterCreator can not return null");
+                    }
+                    setRefreshFooter(footer);
                 } else {
                     boolean old = mEnableLoadMore;
                     setRefreshFooter(new BallPulseFooter(thisView.getContext()));
@@ -711,13 +719,7 @@ public class SmartRefreshLayout extends ViewGroup implements RefreshLayout, Nest
     protected void onDetachedFromWindow() {
         super.onDetachedFromWindow();
         mAttachedToWindow = false;
-        mKernel.moveSpinner(0, true);
-        notifyStateChanged(RefreshState.None);
-        if (mHandler != null) {
-            mHandler.removeCallbacksAndMessages(null);
-        }
         mManualLoadMore = true;
-//        mManualNestedScrolling = true;
         animationRunnable = null;
         if (reboundAnimator != null) {
             Animator animator = reboundAnimator;
@@ -726,6 +728,27 @@ public class SmartRefreshLayout extends ViewGroup implements RefreshLayout, Nest
             reboundAnimator.setDuration(0);//cancel会触发End调用，可以判断0来确定是否被cancel
             reboundAnimator.cancel();//会触发 cancel 和 end 调用
             reboundAnimator = null;
+        }
+        /*
+         * 2020-5-27
+         * https://github.com/scwang90/SmartRefreshLayout/issues/1166
+         * 修复 Fragment 脱离屏幕再回到时，菊花转圈，无法关闭的问题。
+         * Smart 脱离屏幕时，必须重置状态，清空mHandler，否则动画等效果会导致 APP 内存泄露
+         */
+        if (mRefreshHeader != null && mState == RefreshState.Refreshing) {
+            mRefreshHeader.onFinish(this, false);
+        }
+        if (mRefreshFooter != null && mState == RefreshState.Loading) {
+            mRefreshFooter.onFinish(this, false);
+        }
+        if (mSpinner != 0) {
+            mKernel.moveSpinner(0, true);
+        }
+        if (mState != RefreshState.None) {
+            notifyStateChanged(RefreshState.None);
+        }
+        if (mHandler != null) {
+            mHandler.removeCallbacksAndMessages(null);
         }
         /*
          * https://github.com/scwang90/SmartRefreshLayout/issues/716
@@ -1628,6 +1651,12 @@ public class SmartRefreshLayout extends ViewGroup implements RefreshLayout, Nest
             if (reboundAnimator == null) {
                 mKernel.animSpinner(-mFooterHeight);
             }
+        } else if (mState == RefreshState.LoadFinish) {
+            /*
+             * 2020-5-26 修复 finishLoadMore 中途
+             * 拖拽导致 状态重置 最终导致 显示 NoMoreData Footer 菊花却任然在转的情况
+             * overSpinner 时 LoadFinish 状态无任何操作即可
+             */
         } else if (mSpinner != 0) {
             mKernel.animSpinner(0);
         }
@@ -2465,31 +2494,25 @@ public class SmartRefreshLayout extends ViewGroup implements RefreshLayout, Nest
         this.mRefreshHeader = header;
         this.mHeaderBackgroundColor = 0;
         this.mHeaderNeedTouchEventWhenRefreshing = false;
-        this.mHeaderHeightStatus = mHeaderHeightStatus.unNotify();
+        this.mHeaderHeightStatus = DimensionStatus.DefaultUnNotify;//2020-5-23 修复动态切换时，不能及时测量新的高度
         /*
-         * 2019-12-24 修复 DefaultRefreshHeaderCreator 返回 null 时出现空指针
-         * 不过 DefaultRefreshHeaderCreator 是定义为不允许返回空的
+         * 2020-3-16 修复 header 中自带 LayoutParams 丢失问题
          */
-        if (mRefreshHeader != null) {
-            /*
-             * 2020-3-16 修复 header 中自带 LayoutParams 丢失问题
-             */
-            width = width == 0 ? MATCH_PARENT : width;
-            height = height == 0 ? WRAP_CONTENT : height;
-            LayoutParams lp = new LayoutParams(width, height);
-            Object olp = mRefreshHeader.getView().getLayoutParams();
-            if (olp instanceof LayoutParams) {
-                lp = ((LayoutParams) olp);
-            }
-            if (mRefreshHeader.getSpinnerStyle().front) {
-                final ViewGroup thisGroup = this;
-                super.addView(mRefreshHeader.getView(), thisGroup.getChildCount(), lp);
-            } else {
-                super.addView(mRefreshHeader.getView(), 0, lp);
-            }
-            if (mPrimaryColors != null && mRefreshHeader != null) {
-                mRefreshHeader.setPrimaryColors(mPrimaryColors);
-            }
+        width = width == 0 ? MATCH_PARENT : width;
+        height = height == 0 ? WRAP_CONTENT : height;
+        LayoutParams lp = new LayoutParams(width, height);
+        Object olp = mRefreshHeader.getView().getLayoutParams();
+        if (olp instanceof LayoutParams) {
+            lp = ((LayoutParams) olp);
+        }
+        if (mRefreshHeader.getSpinnerStyle().front) {
+            final ViewGroup thisGroup = this;
+            super.addView(mRefreshHeader.getView(), thisGroup.getChildCount(), lp);
+        } else {
+            super.addView(mRefreshHeader.getView(), 0, lp);
+        }
+        if (mPrimaryColors != null && mRefreshHeader != null) {
+            mRefreshHeader.setPrimaryColors(mPrimaryColors);
         }
         return this;
     }
@@ -2525,32 +2548,26 @@ public class SmartRefreshLayout extends ViewGroup implements RefreshLayout, Nest
         this.mFooterBackgroundColor = 0;
         this.mFooterNoMoreDataEffective = false;
         this.mFooterNeedTouchEventWhenLoading = false;
-        this.mFooterHeightStatus = mFooterHeightStatus.unNotify();
+        this.mFooterHeightStatus = DimensionStatus.DefaultUnNotify;//2020-5-23 修复动态切换时，不能及时测量新的高度
         this.mEnableLoadMore = !mManualLoadMore || mEnableLoadMore;
         /*
-         * 2019-12-24 修复 DefaultRefreshFooterCreator 返回 null 时出现空指针
-         * 不过 DefaultRefreshFooterCreator 是定义为不允许返回空的
+         * 2020-3-16 修复 header 中自带 LayoutParams 丢失问题
          */
-        if (mRefreshFooter != null) {
-            /*
-             * 2020-3-16 修复 header 中自带 LayoutParams 丢失问题
-             */
-            width = width == 0 ? MATCH_PARENT : width;
-            height = height == 0 ? WRAP_CONTENT : height;
-            LayoutParams lp = new LayoutParams(width, height);
-            Object olp = mRefreshFooter.getView().getLayoutParams();
-            if (olp instanceof LayoutParams) {
-                lp = ((LayoutParams) olp);
-            }
-            if (mRefreshFooter.getSpinnerStyle().front) {
-                final ViewGroup thisGroup = this;
-                super.addView(mRefreshFooter.getView(), thisGroup.getChildCount(), lp);
-            } else {
-                super.addView(mRefreshFooter.getView(), 0, lp);
-            }
-            if (mPrimaryColors != null && mRefreshFooter != null) {
-                mRefreshFooter.setPrimaryColors(mPrimaryColors);
-            }
+        width = width == 0 ? MATCH_PARENT : width;
+        height = height == 0 ? WRAP_CONTENT : height;
+        LayoutParams lp = new LayoutParams(width, height);
+        Object olp = mRefreshFooter.getView().getLayoutParams();
+        if (olp instanceof LayoutParams) {
+            lp = ((LayoutParams) olp);
+        }
+        if (mRefreshFooter.getSpinnerStyle().front) {
+            final ViewGroup thisGroup = this;
+            super.addView(mRefreshFooter.getView(), thisGroup.getChildCount(), lp);
+        } else {
+            super.addView(mRefreshFooter.getView(), 0, lp);
+        }
+        if (mPrimaryColors != null && mRefreshFooter != null) {
+            mRefreshFooter.setPrimaryColors(mPrimaryColors);
         }
         return this;
     }
@@ -2890,7 +2907,7 @@ public class SmartRefreshLayout extends ViewGroup implements RefreshLayout, Nest
                         reboundAnimator.cancel();//会触发 cancel 和 end 调用
                         reboundAnimator = null;
                         /*
-                         * 2019-1-4 BUG修复
+                         * 2020-1-4 BUG修复
                          * https://github.com/scwang90/SmartRefreshLayout/issues/1104
                          * 如果当前状态为 PullDownToRefresh 并且 mSpinner != 0
                          * mKernel.setState(RefreshState.None); 内部会调用 animSpinner(0); 动画关闭
@@ -3032,7 +3049,7 @@ public class SmartRefreshLayout extends ViewGroup implements RefreshLayout, Nest
                         reboundAnimator.cancel();//会触发 cancel 和 end 调用
                         reboundAnimator = null;
                         /*
-                         * 2019-1-4 BUG修复
+                         * 2020-1-4 BUG修复
                          * https://github.com/scwang90/SmartRefreshLayout/issues/1104
                          * 如果当前状态为 PullDownToRefresh 并且 mSpinner != 0
                          * mKernel.setState(RefreshState.None); 内部会调用 animSpinner(0); 动画关闭
